@@ -1,0 +1,21 @@
+# ═══════════════════════════════════════════════════════════════
+#  Younes — Raspberry Pi Requirements
+#  Install order matters — follow the README steps below
+# ═══════════════════════════════════════════════════════════════
+
+# Wake word
+pvporcupine==4.0.0
+
+# Audio I/O
+pyaudio==0.2.14
+sounddevice==0.4.6
+
+# Numerics
+numpy==1.24.4
+
+# HTTP client
+requests==2.31.0
+
+# VAD — PyTorch CPU only (no CUDA on Pi)
+# Install separately — see README
+# torch==2.1.0
