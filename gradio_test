@@ -1,0 +1,495 @@
+import os
+import gc
+import glob
+import tempfile
+import asyncio
+import re
+import torch
+import torchaudio
+import gradio as gr
+import gradio_client.utils as _gc_utils  
+
+import time
+from datetime import datetime
+from typing import List, Tuple, Dict, Any, Optional
+from huggingface_hub import snapshot_download
+from transformers.pipelines import pipeline  
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
+from openai import AsyncOpenAI
+
+# =================== GRADIO BUG PATCH ===================
+import gradio_client.utils as _gc_utils
+
+_original_json_schema_to_python_type = _gc_utils._json_schema_to_python_type  # type: ignore[attr-defined]
+
+def _patched_json_schema_to_python_type(schema, defs=None):  # type: ignore
+    # لو schema مش dict (زي True أو False أو None) ارجع "Any" بدل ما تقع
+    if not isinstance(schema, dict):
+        return "Any"
+    # لو additionalProperties موجودة وهي bool كمان نعالجها
+    if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], dict):
+        schema = {**schema, "additionalProperties": {"type": "string"}}
+    return _original_json_schema_to_python_type(schema, defs)
+
+_gc_utils._json_schema_to_python_type = _patched_json_schema_to_python_type  # type: ignore[attr-defined]
+
+# patch get_type كمان عشان نكون safe
+_original_get_type = _gc_utils.get_type  # type: ignore[attr-defined]
+
+def _patched_get_type(schema):  # type: ignore
+    if not isinstance(schema, dict):
+        return "Any"
+    return _original_get_type(schema)
+
+_gc_utils.get_type = _patched_get_type  # type: ignore[attr-defined]
+# =================== END PATCH ===================
+# =================== CUDA OPTIMIZATIONS ===================
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+
+# =================== CACHE SETUP ===================
+HF_HOME = os.path.expanduser("~/hf")
+os.makedirs(HF_HOME, exist_ok=True)
+os.environ["HF_HOME"] = HF_HOME
+os.environ["HF_HUB_CACHE"] = os.path.join(HF_HOME, "hub")
+os.environ["TRANSFORMERS_CACHE"] = os.path.join(HF_HOME, "transformers")
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# =================== OPTIMIZED ELDERLY PROMPT ===================
+ELDERLY_PROMPT = """# System Prompt: Younes (The Wise & Dutiful Egyptian Son)
+
+## Role and Persona
+You are "Younes," a 35-year-old authentic Egyptian man. You act as a "Dutiful Son" (El-Ibn El-Barr) and a "Wise Grandson" for elderly users. You are not a robot; you are a supportive, warm, and street-smart family member. Your goal is to provide companionship, respect, and wisdom.
+
+## Language and Dialect Constraints
+- MANDATORY: Use ONLY Egyptian Street Arabic (Ammiya Masriya).
+- TONE: Warm, calm, and deeply respectful. Use "White Ammiya" (Cairo/Delta dialect).
+- STYLE: Avoid Modern Standard Arabic (Fusha) completely. Do not use (سوف، لماذا، كيف، لا تقلق). Use (هـ، ليه، إزاي، متقلقش).
+- HONORIFICS: Constantly use Egyptian terms of endearment: (يا والدنا، يا ست الكل، يا غالي، يا فندم، يا ست الناس، يا حبيبي).
+
+## Communication Guidelines
+- BREVITY IS KEY: Your response MUST be under 140 characters to ensure perfect voice synthesis.
+- KNOWLEDGE SCOPE: You are allowed to discuss ANY topic (Politics, Medicine, Social issues) but always from a "familial, personal opinion" perspective. 
+- MEDICAL ADVICE: Give simple, comforting home-style advice (e.g., "rest," "drink warm lemon") but always conclude with a gentle reminder to check with a doctor to be safe.
+- SPIRITUALITY: Include common Egyptian blessings (Duaa): "ربنا يبارك في عمرك"، "ربنا يشفيك ويعافيك"، "الدوام لله".
+
+## Output Format Rules
+- NO internal reasoning or thinking tags.
+- NO bullet points or structured lists.
+- NO English or Chinese characters. Start speaking Arabic immediately.
+
+## Few-Shot Examples (The Soul of Younes)
+User: "أنا وحيد وزعلان يا يونس، ومفتقد الأيام الحلوة."
+Younes: "يا غالي إحنا معاك وجنبك، والبركة كلها في وجودك معانا. الدنيا لسه بخير طول ما إنت فيها، تحب أحكي لك حكاية من بتاعة زمان تحسن بالك؟"
+
+User: "إيه رأيك في صدام حسين؟ الناس بتقول عليه كلام كتير."
+Younes: "والله يا والدي كان راجل له هيبة وشخصية قوية، وأيامه كان لها وضعها. ربنا يرحم الكل، المهم إنت روق بالك وماتشغلش نفسك بالسياسة، إحنا هنا عشان نخدمك وبس."
+
+User: "ضغطي عالي وراسي مصدعة أوي."
+Younes: "سلامتك من الآه يا ست الكل، ألف سلامة عليكي. ارتاحي بس شوية في الضلمة واشربي كوباية كركديه بارد، ولو فضلتي تعبانة لازم نكلم الدكتور يطمنا، صحتك عندنا بالدنيا."
+
+User: "ظهري واجعني أوي يا يونس، والروماتيزم مبهدلني."
+Younes: "سلامة قلبك يا والدي، ألف سلامة عليك. حاول ترتاح وتفرد ظهرك، واشرب حاجة دافية تريح جسمك، ولو الوجع زاد لازم نكلم الدكتور يطمنا، صحتك عندنا بالدنيا."
+User: "أنت مين يا ابني وبتاع إيه؟"
+Younes: "أنا يونس، ابنك اللي ربنا بعته عشان يشيلك في عينه ويخدمك. أنا هنا عشان أسمعك وأكون معاك في أي وقت، ربنا يبارك لنا في عمرك ويخليك لينا."
+
+User: "مراتي ماتت وبقيت لوحدي في البيت."
+Younes: "الدوام لله يا غالي، ربنا يرحمها ويصبر قلبك، كانت ست أصيلة وعمرها ما تتعوض. أنا معاك أهو ومش هسيبك أبدًا، تحب أطلب لك حد من الولاد يكلمك يطمن عليك؟"
+"""
+
+# =================== GLOBAL VARIABLES ===================
+conversation_history: List[Dict[str, str]] = []
+asr_pipe: Any = None
+openai_client: Optional[AsyncOpenAI] = None
+xtts_model: Optional[Xtts] = None
+gpt_cond_latent: Optional[torch.Tensor] = None
+speaker_embedding: Optional[torch.Tensor] = None
+SPEAKER_WAV: Optional[str] = None
+
+VLLM_API_BASE = "http://localhost:8000/v1"
+VLLM_MODEL_NAME = "Qwen/Qwen2.5-14B-Instruct-AWQ"
+
+# =================== UTILITY FUNCTIONS ===================
+def cleanup_gpu_memory():
+    """Clean GPU memory"""
+    if torch.cuda.is_available():
+        print("🧹 Cleaning GPU memory...")
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        
+        allocated = torch.cuda.memory_allocated() / 1e9
+        total = torch.cuda.get_device_properties(0).total_memory / 1e9
+        free = total - allocated
+        
+        print(f"💾 GPU Memory: {allocated:.2f}GB / {total:.2f}GB (Free: {free:.2f}GB)")
+        return free
+    return 0
+
+def clean_arabic_response(text: str) -> str:
+    """Remove non-Arabic characters"""
+    cleaned = re.sub(r'[^\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF0-9\s\.,!?،؛]', '', text)
+    return cleaned.strip()
+
+
+
+# =================== INITIALIZATION ===================
+def initialize_asr():
+    """Initialize ASR"""
+    global asr_pipe
+    print("⏳ Loading Egyptian ASR...")
+    start = time.time()
+    asr_pipe = pipeline(
+        "automatic-speech-recognition",
+        model="IbrahimAmin/egyptian-arabic-wav2vec2-xlsr-53",
+        device=0 if device == "cuda" else -1,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32
+    )
+    print(f"✅ ASR loaded in {time.time() - start:.1f}s")
+
+def initialize_openai_client():
+    """Initialize OpenAI client for vLLM"""
+    global openai_client
+    print("⏳ Initializing OpenAI client for vLLM...")
+    
+    openai_client = AsyncOpenAI(
+        api_key="EMPTY",
+        base_url=VLLM_API_BASE
+    )
+    
+    print(f"✅ OpenAI client initialized (connecting to {VLLM_API_BASE})")
+    print("ℹ️  Make sure vLLM server is running!")
+
+def initialize_tts():
+    """Initialize TTS"""
+    global xtts_model, gpt_cond_latent, speaker_embedding, SPEAKER_WAV
+    
+    print("⏳ Loading EGTTS...")
+    start = time.time()
+    
+    try:
+        EGTTS_DIR = snapshot_download(
+            repo_id="OmarSamir/EGTTS-V0.1",
+            repo_type="model",
+            cache_dir=os.environ["HF_HUB_CACHE"],
+            allow_patterns=["*.json", "*.pth", "*.wav"],
+        )
+        
+        CONFIG_PATH = os.path.join(EGTTS_DIR, "config.json")
+        VOCAB_PATH = os.path.join(EGTTS_DIR, "vocab.json")
+        
+        config = XttsConfig()
+        config.load_json(CONFIG_PATH)
+        
+        xtts_model = Xtts.init_from_config(config)
+        xtts_model.load_checkpoint(config, checkpoint_dir=EGTTS_DIR, vocab_path=VOCAB_PATH, use_deepspeed=False, strict=False)
+        xtts_model.to(device)
+        xtts_model.eval()
+        
+        cand = glob.glob(os.path.join(EGTTS_DIR, "*.wav")) + glob.glob(os.path.join(EGTTS_DIR, "**/*.wav"), recursive=True)
+        SPEAKER_WAV = cand[0] if cand else None
+        
+        if SPEAKER_WAV:
+            gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(
+                audio_path=[SPEAKER_WAV], gpt_cond_len=24, max_ref_length=50
+            )
+        
+        print(f"✅ EGTTS loaded in {time.time() - start:.1f}s")
+    except Exception as e:
+        print(f"❌ TTS failed: {e}")
+        xtts_model = None
+
+# =================== ASYNC FUNCTIONS ===================
+async def async_asr(audio_path: str) -> str:
+    """Async ASR - loads audio manually then passes numpy array"""
+    loop = asyncio.get_event_loop()
+
+    def _transcribe() -> str:
+        # Load audio with torchaudio (no ffmpeg needed)
+        waveform, sr = torchaudio.load(audio_path)
+
+        # Resample to 16kHz if needed
+        if sr != 16000:
+            waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
+
+        # Convert to mono
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        # Convert to numpy float32
+        audio_np = waveform.squeeze().numpy().astype("float32")
+
+        # Pass numpy array directly — no ffmpeg needed
+        result = asr_pipe(  # type: ignore
+            {"array": audio_np, "sampling_rate": 16000}
+        )
+        return result["text"].strip() if isinstance(result, dict) else str(result).strip()
+
+    return await loop.run_in_executor(None, _transcribe)
+    
+async def async_llm_openai(text: str) -> str:
+    """Generate response using vLLM OpenAI API"""
+    if openai_client is None:
+        raise RuntimeError("OpenAI client not initialized")
+    
+    # Build messages with proper typing
+    messages: List[Dict[str, str]] = [{"role": "system", "content": ELDERLY_PROMPT}]
+    
+    # Add conversation history
+    for hist in conversation_history[-2:]:
+        messages.append({"role": "user", "content": hist["user"]})
+        messages.append({"role": "assistant", "content": hist["assistant"]})
+    
+    messages.append({"role": "user", "content": text})
+    
+    try:
+        # Call vLLM with anti-hallucination settings
+        response = await openai_client.chat.completions.create(
+            model=VLLM_MODEL_NAME,
+            messages=messages,  # type: ignore
+            
+            # Anti-hallucination parameters
+            temperature=0.1,        # Low = less hallucination
+            top_p=0.85,
+            max_tokens=80,
+            
+            frequency_penalty=0.3,
+            presence_penalty=0.2,
+            
+            stop=["User:", "user:", "المستخدم:", "###", "\n\n\n"],
+        )
+        
+        llm_text = response.choices[0].message.content
+        if llm_text is None:
+            llm_text = "معلش، ما فهمتش. ممكن تعيد؟"
+        
+        llm_text = llm_text.strip()
+        llm_text = clean_arabic_response(llm_text)
+        
+        return llm_text
+        
+    except Exception as e:
+        print(f"❌ LLM error: {e}")
+        return "معلش، حصلت مشكلة. ممكن تعيد تاني؟"
+def complete_sentence(text: str, limit: int = 200) -> str:  # ✅ زود لـ 200
+    """بتقص النص عند آخر علامة ترقيم موجودة *داخل* حدود الـ limit"""
+    text = text.strip()
+    
+    # لو النص أصلاً أصغر من الليميت، سيبه زي ما هو
+    if len(text) <= limit:
+        return text
+    
+    # بنقص النص عند الليميت الأول
+    truncated_text = text[:limit]
+    
+    # ندور على آخر علامة ترقيم داخل الجزء المقصوص
+    last_mark = -1
+    for mark in ['.', '!', '؟', '،', '؛']:
+        pos = truncated_text.rfind(mark)
+        if pos > last_mark:
+            last_mark = pos
+            
+    # لو لقينا علامة ترقيم (في النص التاني من الجملة)
+    if last_mark > limit // 2: 
+        return truncated_text[:last_mark + 1]
+    
+    # لو مالقيناش، بنقص عند آخر مسافة
+    last_space = truncated_text.rfind(' ')
+    if last_space != -1:
+        return truncated_text[:last_space]  # ✅ شيلت ".." عشان مش محتاجها في الصوت
+        
+    return truncated_text
+
+
+async def async_tts(text: str) -> Optional[str]:
+    """Async TTS with smart sentence completion"""
+    if not xtts_model:
+        return None
+    
+    loop = asyncio.get_event_loop()
+    
+    def _synthesize():
+        # ✅ استخدم complete_sentence بـ limit = 200
+        text_limited = complete_sentence(text, limit=200)
+        
+        with torch.inference_mode():
+            out = xtts_model.inference(
+                text=text_limited, 
+                language="ar",
+                gpt_cond_latent=gpt_cond_latent, 
+                speaker_embedding=speaker_embedding,
+                temperature=0.80,       
+                repetition_penalty=1.3, 
+                speed=0.9,              
+                top_k=50,               
+                top_p=0.75,             
+            )
+
+        path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+        torchaudio.save(path, torch.tensor(out["wav"]).unsqueeze(0), 24000)
+        return path
+    
+    return await loop.run_in_executor(None, _synthesize)
+
+# =================== MAIN PIPELINE ===================
+async def elderly_assistant_async(audio_path: str):
+    """Main pipeline"""
+    if not audio_path or not os.path.exists(audio_path):
+        return None, "", "", "⚠️ ما فيش صوت مسجل"
+    
+    total_start = time.time()
+    timing = {}
+    
+    try:
+        # ASR
+        print("\n🎤 Transcribing...")
+        t = time.time()
+        asr_text = await async_asr(audio_path)
+        timing['asr'] = time.time() - t
+        print(f"📝 User: {asr_text} ({timing['asr']:.1f}s)")
+        
+        if not asr_text.strip():
+            return None, "مفيش صوت", "", "⚠️ ما سمعتش حاجة"
+        
+        # LLM
+        print("🧠 Generating with vLLM OpenAI...")
+        t = time.time()
+        llm_text = await async_llm_openai(asr_text)
+        timing['llm'] = time.time() - t
+        print(f"💬 Response: {llm_text} ({timing['llm']:.1f}s)")
+        
+        # TTS
+        audio_out = None
+        if xtts_model:
+            t = time.time()
+            audio_out = await async_tts(llm_text)
+            timing['tts'] = time.time() - t
+            if audio_out:
+                print(f"🔊 TTS: {timing['tts']:.1f}s")
+        
+        timing['total'] = time.time() - total_start
+        
+        # Update history
+        conversation_history.append({"user": asr_text, "assistant": llm_text})
+        if len(conversation_history) > 6:
+            conversation_history[:] = conversation_history[-6:]
+        
+        # Cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        
+        # Summary
+        tts_status = "✅ صوت" if audio_out else "⚠️ نص فقط"
+        summary = f"""📊 ملخص
+
+👤 **قلت:** {asr_text}
+🤖 **رد:** {llm_text}
+⏱️ **الوقت:** ASR={timing['asr']:.1f}s | LLM={timing['llm']:.1f}s | TTS={timing.get('tts',0):.1f}s | إجمالي={timing['total']:.1f}s
+🔊 {tts_status}"""
+        
+        print(f"✅ Done: {timing['total']:.1f}s\n")
+        return audio_out, asr_text, llm_text, summary
+        
+    except Exception as e:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        import traceback
+        traceback.print_exc()
+        return None, f"❌ خطأ: {str(e)}", "", f"❌ مشكلة: {str(e)}"
+
+def elderly_assistant_sync(audio_path):
+    """Sync wrapper"""
+    try:
+        return asyncio.run(elderly_assistant_async(audio_path))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, f"خطأ: {str(e)}", "", f"❌ خطأ: {str(e)}"
+
+def clear_conversation():
+    """Clear history"""
+    global conversation_history
+    conversation_history = []
+    return None, "", "", "✅ المحادثة اتمسحت"
+
+# =================== GRADIO UI ===================
+def create_ui():
+    """Create UI"""
+    # Fix for Gradio 6.x
+    try:
+        theme = gr.themes.Soft()  # type: ignore
+    except:
+        theme = "soft"
+    
+    with gr.Blocks(title="يونس - vLLM OpenAI", theme=theme) as demo:
+        gr.Markdown("""
+        # 🎙️ يونس - مساعدك المصري
+        ### 👴👵 مساعد ذكي لكبار السن
+        **✨ Qwen2.5 + vLLM OpenAI + Anti-Hallucination**
+        """)
+        
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### 🎤 سجّل صوتك")
+                audio_in = gr.Audio(sources=["microphone"], type="filepath", label="اضغط واتكلم")
+                with gr.Row():
+                    submit_btn = gr.Button("🗣️ إرسال", variant="primary")
+                    clear_btn = gr.Button("🗑️ مسح")
+            
+            with gr.Column():
+                gr.Markdown("### 🔊 رد يونس")
+                audio_out = gr.Audio(label="استمع")
+                with gr.Accordion("📝 تفاصيل", open=True):
+                    asr_out = gr.Textbox(label="📝 قلت", lines=2)
+                    llm_out = gr.Textbox(label="💬 رد يونس", lines=3)
+        
+        summary_out = gr.Textbox(label="📊 ملخص", lines=7)
+        
+        submit_btn.click(elderly_assistant_sync, inputs=[audio_in], outputs=[audio_out, asr_out, llm_out, summary_out])
+        clear_btn.click(clear_conversation, outputs=[audio_out, asr_out, llm_out, summary_out])
+    
+    return demo
+
+# =================== MAIN ===================
+if __name__ == "__main__":
+    print(f"🔥 Device: {device} | GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'None'}")
+    print("\n" + "="*70)
+    print("🚀 Younes - Qwen2.5 + vLLM OpenAI (Anti-Hallucination)")
+    print("="*70 + "\n")
+    
+    cleanup_gpu_memory()
+    
+    print("\n📦 Loading models...\n")
+    initialize_asr()
+    initialize_openai_client()
+    initialize_tts()
+    
+    print("\n" + "="*70)
+    print("⚠️  IMPORTANT: Start vLLM server first!")
+    print("="*70)
+    print("\n🔹 Run this command in a SEPARATE terminal:")
+    print("\n```bash")
+    print("vllm serve Qwen/Qwen2.5-14B-Instruct-AWQ \\")
+    print("  --quantization awq \\")
+    print("  --dtype half \\")
+    print("  --max-model-len 2048 \\")
+    print("  --gpu-memory-utilization 0.6 \\")
+    print("  --port 8000")
+    print("```\n")
+    print("Wait for: 'Uvicorn running on http://0.0.0.0:8000'")
+    print("Then press Enter here to continue...")
+    input()
+    
+    print("\n✅ Ready!\n")
+    
+    demo = create_ui()
+    demo.queue()
+    demo.launch(share=True, server_name="0.0.0.0", server_port=7863, show_error=True)
