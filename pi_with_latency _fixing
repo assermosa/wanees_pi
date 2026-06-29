@@ -459,3 +459,5 @@ finally:
     porcupine.delete()
     http_session.close()
     print("Cleanup done. Goodbye!")
+    http_session.close()
+    print("Cleanup done. Goodbye!")
