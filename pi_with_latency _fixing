@@ -1,15 +1,11 @@
 """
 pi_client_optimized.py
 ======================
-Wanees AI — Raspberry Pi Client (Final Version)
+Wanees AI — Raspberry Pi Client (Fixed Version)
 
-Features:
-  1. Porcupine wake word detection
-  2. Silero VAD streaming recording
-  3. Pre-buffered streaming TTS playback (no stutter)
-  4. Follow-up conversation window (no wake word needed)
-  5. Thread-safe Queue between HTTP reader and audio player
-  6. Connection pooling via requests.Session
+Fix: Pre-buffer timeout split into two phases:
+  - Phase A: wait up to 15s for FIRST chunk (XTTS synthesis delay)
+  - Phase B: wait only 0.5s per chunk after first arrives
 """
 
 import math
@@ -58,18 +54,19 @@ NO_SPEECH_TIMEOUT_SEC = 5.0
 FOLLOWUP_WINDOW_SEC = 15.0
 
 # HTTP
-HTTP_TIMEOUT_CONNECT = 5
-HTTP_TIMEOUT_READ    = 60
-HTTP_CHUNK_BYTES     = 4_096
+HTTP_TIMEOUT_CONNECT  = 10    # was 5 — give cloud more time to accept
+HTTP_TIMEOUT_READ     = 60
+HTTP_CHUNK_BYTES      = 4_096
 
 # Audio player
 SAMPLES_PER_FRAME  = 1024
 BYTES_PER_FRAME    = SAMPLES_PER_FRAME * 2    # int16 = 2 bytes
 QUEUE_MAXSIZE      = 50
 
-# Pre-buffer (safety against network jitter)
-PRE_BUFFER_CHUNKS  = 3      # collect N chunks before opening pa_out
-PRE_BUFFER_TIMEOUT = 4.0    # max seconds to wait for pre-buffer to fill
+# Pre-buffer — FIXED VALUES
+PRE_BUFFER_CHUNKS        = 3
+FIRST_CHUNK_TIMEOUT      = 20.0   # wait up to 20s for XTTS to synthesize first chunk
+SUBSEQUENT_CHUNK_TIMEOUT = 0.5    # after first chunk arrives, 0.5s per chunk is plenty
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -93,9 +90,8 @@ def generate_beep(
     return (wave * 32767).astype(np.int16)
 
 
-# Pre-generate at startup
-BEEP_HIGH = generate_beep(frequency=880, duration=0.18)   # wake word confirmed
-BEEP_LOW  = generate_beep(frequency=440, duration=0.12)   # follow-up window closed
+BEEP_HIGH = generate_beep(frequency=880, duration=0.18)
+BEEP_LOW  = generate_beep(frequency=440, duration=0.12)
 
 
 def play_beep(audio: np.ndarray = None) -> None:
@@ -135,10 +131,8 @@ vad_iter = VADIterator(
 )
 print("✅ Silero VAD ready")
 
-# PyAudio instance (shared)
 pa = pyaudio.PyAudio()
 
-# Persistent HTTP session (connection pooling)
 http_session = requests.Session()
 http_session.headers.update({"Content-Type": "audio/octet-stream"})
 
@@ -150,7 +144,6 @@ print("✅ All models loaded — ready\n")
 # ═══════════════════════════════════════════════════════════════
 
 def int2float(pcm_bytes: bytes) -> np.ndarray:
-    """Convert raw int16 PCM bytes → float32 numpy array [-1, 1]."""
     return np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
 
@@ -162,15 +155,6 @@ def record_speech_with_vad(
     stream,
     no_speech_timeout: float = NO_SPEECH_TIMEOUT_SEC,
 ) -> list:
-    """
-    Record audio frames until:
-      - VAD detects end of speech, OR
-      - MAX_SPEECH_SEC reached, OR
-      - no speech starts within no_speech_timeout seconds
-
-    Returns list of raw PCM byte-frames (int16, 16 kHz mono).
-    Returns empty list on timeout with no speech.
-    """
     try:
         vad_iter.reset_states()
     except AttributeError:
@@ -195,35 +179,29 @@ def record_speech_with_vad(
         with torch.no_grad():
             vad_out = vad_iter(tensor, return_seconds=False)
 
-        # Rolling pre-speech buffer
         if not speech_started:
             pre_buffer.append(raw)
             if len(pre_buffer) > pre_buffer_max:
                 pre_buffer.pop(0)
 
-        # Speech start
         if vad_out and "start" in vad_out:
             speech_started = True
             speech_frames.extend(pre_buffer)
             pre_buffer = []
             print("🗣  Speech started…")
 
-        # Accumulate frames
         if speech_started and not speech_ended:
             speech_frames.append(raw)
 
-        # Speech end
         if vad_out and "end" in vad_out:
             speech_ended = True
             print("🔇 Speech ended.")
             break
 
-        # Hard duration cap
         if len(speech_frames) >= max_frames:
             print(f"⏱ Max duration ({MAX_SPEECH_SEC}s) reached.")
             break
 
-        # No-speech timeout
         if not speech_started and total_frames >= no_speech_frames:
             return []
 
@@ -231,67 +209,64 @@ def record_speech_with_vad(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  STREAMING TTS PLAYBACK  (HTTP reader → Queue → Player thread)
+#  STREAMING TTS PLAYBACK  — FIXED
 # ═══════════════════════════════════════════════════════════════
 
 def stream_audio_to_server(pcm_frames: list) -> bool:
-    """
-    1. Send PCM to Lightning AI server via streaming POST.
-    2. HTTP reader puts raw chunks into a Queue.
-    3. Audio player thread:
-         a. Collects PRE_BUFFER_CHUNKS before opening pa_out
-            (safety buffer against network jitter).
-         b. Plays chunks with fixed frame alignment (no stutter).
-    Returns True if audio was received and played successfully.
-    """
     full_pcm = b"".join(pcm_frames)
     duration  = len(full_pcm) / (RATE * 2)
     print(f"📤 Sending {len(full_pcm)/1024:.1f} KB  ({duration:.1f}s)…")
 
     audio_queue : queue.Queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
-    got_audio   = threading.Event()   # set when HTTP reader finishes
-    player_done = threading.Event()   # set when player thread exits
-    error_event = threading.Event()   # set on player error
+    got_audio   = threading.Event()
+    player_done = threading.Event()
+    error_event = threading.Event()
 
     # ─────────────────────────────────────────────────────────
-    #  Audio Player Thread
+    #  Audio Player Thread — FIXED pre-buffer logic
     # ─────────────────────────────────────────────────────────
     def audio_player():
-        # ── Phase A: Pre-buffer ───────────────────────────────
-        pre_buffer_data  = b""
-        chunks_collected = 0
-        wait_start       = time.time()
+        print("⏳ Waiting for server to synthesize audio…")
 
-        print("⏳ Buffering…")
+        # ── Phase A: wait for FIRST chunk ─────────────────────
+        # XTTS needs 5-10s to synthesize before any bytes flow.
+        # We wait up to FIRST_CHUNK_TIMEOUT seconds here.
+        try:
+            first_chunk = audio_queue.get(timeout=FIRST_CHUNK_TIMEOUT)
+        except queue.Empty:
+            print("⚠ No audio received from server — synthesis may have failed.")
+            player_done.set()
+            return
+
+        if first_chunk is None:
+            print("⚠ No audio received from server.")
+            player_done.set()
+            return
+
+        print(f"✅ First chunk arrived ({len(first_chunk)} bytes) — buffering…")
+
+        # ── Phase B: collect remaining pre-buffer chunks ───────
+        # Network is flowing now, so 0.5s per chunk is enough.
+        pre_buffer_data = first_chunk
+        chunks_collected = 1
 
         while chunks_collected < PRE_BUFFER_CHUNKS:
-            if time.time() - wait_start > PRE_BUFFER_TIMEOUT:
-                print("⚠ Pre-buffer timeout — starting with what we have")
-                break
             try:
-                chunk = audio_queue.get(timeout=1.0)
+                chunk = audio_queue.get(timeout=SUBSEQUENT_CHUNK_TIMEOUT)
             except queue.Empty:
-                if got_audio.is_set():
-                    break
-                continue
+                break   # fewer chunks than target is fine — start playing
 
             if chunk is None:
-                # Stream ended before pre-buffer filled
-                audio_queue.put(None)   # put sentinel back for main loop
+                audio_queue.put(None)   # put sentinel back for drain loop
                 break
 
             pre_buffer_data  += chunk
             chunks_collected += 1
 
-        if not pre_buffer_data:
-            print("⚠ No audio received from server.")
-            player_done.set()
-            return
+        print(f"🔊 Pre-buffered {len(pre_buffer_data)/1024:.1f} KB "
+              f"({chunks_collected} chunks) — starting playback…")
 
-        collected_kb = len(pre_buffer_data) / 1024
-        print(f"🔊 Pre-buffered {collected_kb:.1f} KB — starting playback…")
-
-        # ── Phase B: Open stream and play ─────────────────────
+        # ── Phase C: open PyAudio output stream ───────────────
         pa_out = pa.open(
             format=pyaudio.paInt16,
             channels=1,
@@ -303,10 +278,7 @@ def stream_audio_to_server(pcm_frames: list) -> bool:
         leftover = b""
 
         def write_aligned(data: bytes) -> bytes:
-            """
-            Write only complete BYTES_PER_FRAME blocks to pa_out.
-            Returns any trailing bytes that didn't fill a full frame.
-            """
+            """Write only complete frames; return leftover bytes."""
             combined   = leftover + data
             n_complete = (len(combined) // BYTES_PER_FRAME) * BYTES_PER_FRAME
             if n_complete > 0:
@@ -317,7 +289,7 @@ def stream_audio_to_server(pcm_frames: list) -> bool:
             # Play pre-buffered data first
             leftover = write_aligned(pre_buffer_data)
 
-            # Then drain the queue
+            # Drain the queue until sentinel or timeout
             while True:
                 try:
                     chunk = audio_queue.get(timeout=2.0)
@@ -331,11 +303,11 @@ def stream_audio_to_server(pcm_frames: list) -> bool:
 
                 leftover = write_aligned(chunk)
 
-            # Flush any remaining bytes (pad to full frame)
+            # Flush remaining bytes (pad to full frame with silence)
             if leftover:
-                pad_needed = BYTES_PER_FRAME - (len(leftover) % BYTES_PER_FRAME)
-                if pad_needed != BYTES_PER_FRAME:
-                    leftover += b"\x00" * pad_needed
+                pad = BYTES_PER_FRAME - (len(leftover) % BYTES_PER_FRAME)
+                if pad != BYTES_PER_FRAME:
+                    leftover += b"\x00" * pad
                 pa_out.write(leftover)
 
         except Exception as e:
@@ -362,19 +334,21 @@ def stream_audio_to_server(pcm_frames: list) -> bool:
         )
         resp.raise_for_status()
 
-        first = True
+        chunk_count = 0
         for chunk in resp.iter_content(chunk_size=HTTP_CHUNK_BYTES):
             if not chunk:
                 continue
-            if first:
-                first = False
-            # Backpressure: blocks if queue is full
-            audio_queue.put(chunk)
+            chunk_count += 1
+            if chunk_count == 1:
+                print(f"📦 First HTTP chunk received ({len(chunk)} bytes)")
+            audio_queue.put(chunk)   # blocks if queue full (backpressure)
 
-        success = not first
+        success = chunk_count > 0
+        if not success:
+            print("⚠ Server returned 200 but sent 0 bytes of audio.")
 
     except requests.exceptions.Timeout:
-        print("❌ Server timeout.\n")
+        print("❌ Server timeout — XTTS may still be loading.\n")
     except requests.exceptions.ConnectionError:
         print("❌ Cannot reach server — check SERVER_URL.\n")
     except Exception as e:
@@ -383,7 +357,6 @@ def stream_audio_to_server(pcm_frames: list) -> bool:
         got_audio.set()
         audio_queue.put(None)   # sentinel to unblock player
 
-    # Wait for player to finish before returning
     player_done.wait(timeout=30.0)
 
     if success and not error_event.is_set():
@@ -397,10 +370,6 @@ def stream_audio_to_server(pcm_frames: list) -> bool:
 # ═══════════════════════════════════════════════════════════════
 
 def followup_listen(stream) -> list:
-    """
-    After TTS ends, keep mic open for FOLLOWUP_WINDOW_SEC seconds.
-    Returns speech frames if user speaks, empty list on timeout.
-    """
     print(f"💬 Follow-up window open ({FOLLOWUP_WINDOW_SEC}s) — speak freely…\n")
 
     frames = record_speech_with_vad(
@@ -444,10 +413,9 @@ try:
 
         print("🔔 Wake word detected!")
 
-        # Beep in separate thread so mic keeps buffering during playback
         beep_thread = threading.Thread(target=play_beep, daemon=True)
         beep_thread.start()
-        beep_thread.join()   # wait ~180ms before recording
+        beep_thread.join()
 
         # ══════════════════════════════════════════════════════
         #  PHASE 2 — First Utterance
@@ -462,14 +430,12 @@ try:
 
         # ══════════════════════════════════════════════════════
         #  PHASE 3 — Follow-up Conversation Loop
-        #  Keeps conversation alive without wake word
         # ══════════════════════════════════════════════════════
         if got_response:
             while True:
                 followup_frames = followup_listen(mic_stream)
 
                 if not followup_frames:
-                    # Timeout — exit conversation
                     break
 
                 print("🔄 Follow-up detected — sending…")
